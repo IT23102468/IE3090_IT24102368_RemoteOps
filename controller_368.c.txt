@@ -1,0 +1,240 @@
+/* controller_368.c - RemoteOps Controller for IT24102368 */
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <pthread.h>
+#include <fcntl.h>
+
+#define DEFAULT_PORT 9410
+#define BUF_SIZE 4096
+
+int tcp_fd = -1;
+volatile int mon_running = 0;
+int mon_sock = -1;
+
+void *udp_listener(void *arg) {
+    int port = *(int *)arg;
+    free(arg);
+
+    mon_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(port);
+
+    if (bind(mon_sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("UDP bind");
+        return NULL;
+    }
+
+    char buf[512];
+    while (mon_running) {
+        ssize_t n = recvfrom(mon_sock, buf, sizeof(buf)-1, 0, NULL, NULL);
+        if (n > 0) {
+            buf[n] = '\0';
+            printf("[UDP MONITOR] %s", buf);
+            fflush(stdout);
+        }
+    }
+    close(mon_sock);
+    return NULL;
+}
+
+int recv_line(int fd, char *buf, size_t maxlen) {
+    size_t i = 0;
+    char c;
+    while (i < maxlen - 1) {
+        ssize_t n = recv(fd, &c, 1, 0);
+        if (n <= 0) return -1;
+        if (c == '\n') break;
+        if (c != '\r') buf[i++] = c;
+    }
+    buf[i] = '\0';
+    return (int)i;
+}
+
+int recv_exact(int fd, char *buf, size_t len) {
+    size_t got = 0;
+    while (got < len) {
+        ssize_t n = recv(fd, buf + got, len - got, 0);
+        if (n <= 0) return -1;
+        got += n;
+    }
+    return 0;
+}
+
+int send_exact(int fd, const char *buf, size_t len) {
+    size_t sent = 0;
+    while (sent < len) {
+        ssize_t n = send(fd, buf + sent, len - sent, 0);
+        if (n <= 0) return -1;
+        sent += n;
+    }
+    return 0;
+}
+
+void print_help(void) {
+    printf("\nCommands:\n"
+           "  auth <token>\n"
+           "  sysinfo\n"
+           "  listproc\n"
+           "  exec <DATE|UPTIME|DISKFREE|HOSTNAME|WHOAMI>\n"
+           "  put <localfile> <remotename>\n"
+           "  get <remotename> <localfile>\n"
+           "  monitor start <udp_port>\n"
+           "  monitor stop\n"
+           "  quit\n"
+           "  help\n\n");
+}
+
+int main(int argc, char *argv[]) {
+    const char *server = "127.0.0.1";
+    int port = DEFAULT_PORT;
+    if (argc >= 2) server = argv[1];
+    if (argc >= 3) port = atoi(argv[2]);
+
+    tcp_fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    inet_pton(AF_INET, server, &addr.sin_addr);
+
+    if (connect(tcp_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("connect");
+        return 1;
+    }
+    printf("Connected to Agent %s:%d\n", server, port);
+    print_help();
+
+    char line[BUF_SIZE];
+    char resp[BUF_SIZE];
+    pthread_t mon_tid;
+
+    while (1) {
+        printf("RemoteOps> ");
+        fflush(stdout);
+        if (!fgets(line, sizeof(line), stdin)) break;
+        line[strcspn(line, "\n")] = 0;
+        if (strlen(line) == 0) continue;
+
+        if (strcmp(line, "help") == 0) {
+            print_help();
+            continue;
+        }
+
+        char cmd[64], arg1[256], arg2[256];
+        int n = sscanf(line, "%63s %255s %255s", cmd, arg1, arg2);
+
+        if (strcmp(cmd, "auth") == 0 && n >= 2) {
+            char msg[128];
+            snprintf(msg, sizeof(msg), "AUTH %s\n", arg1);
+            send(tcp_fd, msg, strlen(msg), 0);
+            recv_line(tcp_fd, resp, sizeof(resp));
+            printf("%s\n", resp);
+        }
+        else if (strcmp(cmd, "sysinfo") == 0) {
+            send(tcp_fd, "SYSINFO\n", 8, 0);
+            recv_line(tcp_fd, resp, sizeof(resp));
+            printf("%s\n", resp);
+        }
+        else if (strcmp(cmd, "listproc") == 0) {
+            send(tcp_fd, "LISTPROC\n", 9, 0);
+            recv_line(tcp_fd, resp, sizeof(resp));
+            printf("%s\n", resp);
+        }
+        else if (strcmp(cmd, "exec") == 0 && n >= 2) {
+            char msg[128];
+            snprintf(msg, sizeof(msg), "EXEC %s\n", arg1);
+            send(tcp_fd, msg, strlen(msg), 0);
+            recv_line(tcp_fd, resp, sizeof(resp));
+            printf("%s\n", resp);
+        }
+        else if (strcmp(cmd, "put") == 0 && n >= 3) {
+            FILE *fp = fopen(arg1, "rb");
+            if (!fp) { printf("Cannot open local file\n"); continue; }
+            fseek(fp, 0, SEEK_END);
+            long fsize = ftell(fp);
+            fseek(fp, 0, SEEK_SET);
+            char *data = malloc(fsize);
+            fread(data, 1, fsize, fp);
+            fclose(fp);
+
+            char header[512];
+            snprintf(header, sizeof(header), "PUT %s %ld\n", arg2, fsize);
+            send(tcp_fd, header, strlen(header), 0);
+            send_exact(tcp_fd, data, fsize);
+            free(data);
+
+            recv_line(tcp_fd, resp, sizeof(resp));
+            printf("%s\n", resp);
+        }
+        else if (strcmp(cmd, "get") == 0 && n >= 3) {
+            char msg[256];
+            snprintf(msg, sizeof(msg), "GET %s\n", arg1);
+            send(tcp_fd, msg, strlen(msg), 0);
+            recv_line(tcp_fd, resp, sizeof(resp));
+            printf("%s\n", resp);
+
+            if (strncmp(resp, "OK FILE_SEND", 12) == 0) {
+                char fname[256];
+                long fsize;
+                sscanf(resp, "OK FILE_SEND %255s %ld", fname, &fsize);
+                char *data = malloc(fsize);
+                if (recv_exact(tcp_fd, data, fsize) == 0) {
+                    FILE *fp = fopen(arg2, "wb");
+                    if (fp) {
+                        fwrite(data, 1, fsize, fp);
+                        fclose(fp);
+                        printf("Saved %ld bytes to %s\n", fsize, arg2);
+                    }
+                }
+                free(data);
+            }
+        }
+        else if (strcmp(cmd, "monitor") == 0 && n >= 2) {
+            if (strcmp(arg1, "start") == 0 && n >= 3) {
+                int udp_port = atoi(arg2);
+                char msg[128];
+                snprintf(msg, sizeof(msg), "MONITOR START %d\n", udp_port);
+                send(tcp_fd, msg, strlen(msg), 0);
+                recv_line(tcp_fd, resp, sizeof(resp));
+                printf("%s\n", resp);
+
+                if (strstr(resp, "OK MONITOR_STARTED")) {
+                    mon_running = 1;
+                    int *p = malloc(sizeof(int));
+                    *p = udp_port;
+                    pthread_create(&mon_tid, NULL, udp_listener, p);
+                }
+            }
+            else if (strcmp(arg1, "stop") == 0) {
+                send(tcp_fd, "MONITOR STOP\n", 13, 0);
+                recv_line(tcp_fd, resp, sizeof(resp));
+                printf("%s\n", resp);
+                mon_running = 0;
+                if (mon_sock >= 0) close(mon_sock);
+            }
+        }
+        else if (strcmp(cmd, "quit") == 0) {
+            send(tcp_fd, "QUIT\n", 5, 0);
+            recv_line(tcp_fd, resp, sizeof(resp));
+            printf("%s\n", resp);
+            break;
+        }
+        else {
+            printf("Unknown command. Type 'help'\n");
+        }
+    }
+
+    mon_running = 0;
+    close(tcp_fd);
+    return 0;
+}
