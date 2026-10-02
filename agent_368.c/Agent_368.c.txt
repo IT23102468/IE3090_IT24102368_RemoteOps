@@ -1,0 +1,438 @@
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <pthread.h>
+#include <signal.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <time.h>
+#include <sys/sysinfo.h>
+#include <dirent.h>
+
+#define PORT            9410
+#define SID_TAG         "SID:8632"
+#define AUTH_TOKEN      "OPS-2368"
+#define LOG_FILE        "remoteops_IT24102368.log"
+#define STORAGE_DIR     "./agentfiles/IT24102368/"
+#define MAX_CLIENTS     32
+#define BUF_SIZE        4096
+#define MAX_FILE_SIZE   (10 * 1024 * 1024)
+
+typedef struct {
+    int tcp_fd;
+    int authenticated;
+    int monitoring;
+    int udp_port;
+    char client_ip[INET_ADDRSTRLEN];
+    pthread_t mon_tid;
+    volatile int mon_running;
+} client_t;
+
+client_t clients[MAX_CLIENTS];
+pthread_mutex_t clients_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_mutex_t log_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+void log_msg(const char *msg) {
+    pthread_mutex_lock(&log_mutex);
+    FILE *f = fopen(LOG_FILE, "a");
+    if (f) {
+        time_t now = time(NULL);
+        char tbuf[64];
+        strftime(tbuf, sizeof(tbuf), "%Y-%m-%d %H:%M:%S", localtime(&now));
+        fprintf(f, "[%s] %s\n", tbuf, msg);
+        fclose(f);
+    }
+    pthread_mutex_unlock(&log_mutex);
+}
+
+void send_line(int fd, const char *line) {
+    char buf[BUF_SIZE];
+    snprintf(buf, sizeof(buf), "%s %s\n", line, SID_TAG);
+    send(fd, buf, strlen(buf), 0);
+}
+
+int recv_line(int fd, char *buf, size_t maxlen) {
+    size_t i = 0;
+    char c;
+    while (i < maxlen - 1) {
+        ssize_t n = recv(fd, &c, 1, 0);
+        if (n <= 0) return -1;
+        if (c == '\n') break;
+        if (c != '\r') buf[i++] = c;
+    }
+    buf[i] = '\0';
+    return (int)i;
+}
+
+int recv_exact(int fd, char *buf, size_t len) {
+    size_t got = 0;
+    while (got < len) {
+        ssize_t n = recv(fd, buf + got, len - got, 0);
+        if (n <= 0) return -1;
+        got += n;
+    }
+    return 0;
+}
+
+int send_exact(int fd, const char *buf, size_t len) {
+    size_t sent = 0;
+    while (sent < len) {
+        ssize_t n = send(fd, buf + sent, len - sent, 0);
+        if (n <= 0) return -1;
+        sent += n;
+    }
+    return 0;
+}
+
+void get_sysinfo(char *out, size_t outlen) {
+    struct sysinfo si;
+    sysinfo(&si);
+    double load = si.loads[0] / 65536.0;
+    long mem_used_mb = (si.totalram - si.freeram) / (1024 * 1024);
+    long uptime = si.uptime;
+    snprintf(out, outlen, "%.2f %ld %ld", load, mem_used_mb, uptime);
+}
+
+void get_procs(char *out, size_t outlen) {
+    FILE *fp = popen("ps -eo pid,comm --no-headers 2>/dev/null | head -30", "r");
+    if (!fp) {
+        snprintf(out, outlen, "unavailable");
+        return;
+    }
+    out[0] = '\0';
+    char line[128];
+    int first = 1;
+    while (fgets(line, sizeof(line), fp)) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+        for (char *p = line; *p; p++) if (*p == ' ') *p = '/';
+        if (!first) strncat(out, ",", outlen - strlen(out) - 1);
+        strncat(out, line, outlen - strlen(out) - 1);
+        first = 0;
+    }
+    pclose(fp);
+}
+
+int do_exec(const char *name, char *result, size_t reslen) {
+    const char *cmd = NULL;
+    if      (strcmp(name, "DATE")     == 0) cmd = "date";
+    else if (strcmp(name, "UPTIME")   == 0) cmd = "uptime -p";
+    else if (strcmp(name, "DISKFREE") == 0) cmd = "df -h / | tail -1";
+    else if (strcmp(name, "HOSTNAME") == 0) cmd = "hostname";
+    else if (strcmp(name, "WHOAMI")   == 0) cmd = "whoami";
+    else return -1;
+
+    FILE *fp = popen(cmd, "r");
+    if (!fp) {
+        snprintf(result, reslen, "exec_failed");
+        return 0;
+    }
+    if (fgets(result, reslen, fp) == NULL)
+        snprintf(result, reslen, "(empty)");
+    char *nl = strchr(result, '\n');
+    if (nl) *nl = '\0';
+    pclose(fp);
+    return 0;
+}
+
+void *monitor_thread(void *arg) {
+    client_t *cl = (client_t *)arg;
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) return NULL;
+
+    struct sockaddr_in dest;
+    memset(&dest, 0, sizeof(dest));
+    dest.sin_family = AF_INET;
+    dest.sin_port = htons(cl->udp_port);
+    inet_pton(AF_INET, cl->client_ip, &dest.sin_addr);
+
+    while (cl->mon_running) {
+        char stats[128];
+        get_sysinfo(stats, sizeof(stats));
+        char msg[256];
+        snprintf(msg, sizeof(msg), "SYSINFO %s %s\n", stats, SID_TAG);
+        sendto(sock, msg, strlen(msg), 0, (struct sockaddr *)&dest, sizeof(dest));
+        sleep(2);
+    }
+    close(sock);
+    return NULL;
+}
+
+void *client_handler(void *arg) {
+    int fd = *(int *)arg;
+    free(arg);
+
+    char client_ip[INET_ADDRSTRLEN] = "unknown";
+    struct sockaddr_in peer;
+    socklen_t peerlen = sizeof(peer);
+    if (getpeername(fd, (struct sockaddr *)&peer, &peerlen) == 0)
+        inet_ntop(AF_INET, &peer.sin_addr, client_ip, sizeof(client_ip));
+
+    char logbuf[256];
+    snprintf(logbuf, sizeof(logbuf), "New connection from %s fd=%d", client_ip, fd);
+    log_msg(logbuf);
+
+    client_t *cl = NULL;
+    pthread_mutex_lock(&clients_mutex);
+    for (int i = 0; i < MAX_CLIENTS; i++) {
+        if (clients[i].tcp_fd == 0) {
+            cl = &clients[i];
+            memset(cl, 0, sizeof(*cl));
+            cl->tcp_fd = fd;
+            strncpy(cl->client_ip, client_ip, sizeof(cl->client_ip)-1);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&clients_mutex);
+
+    if (!cl) {
+        send_line(fd, "ERR 099 TOO_MANY_CLIENTS");
+        close(fd);
+        return NULL;
+    }
+
+    char line[BUF_SIZE];
+    while (1) {
+        int n = recv_line(fd, line, sizeof(line));
+        if (n <= 0) break;
+
+        snprintf(logbuf, sizeof(logbuf), "fd=%d CMD: %s", fd, line);
+        log_msg(logbuf);
+
+        char *cmd = strtok(line, " ");
+        if (!cmd) continue;
+
+        if (strcmp(cmd, "AUTH") == 0) {
+            char *token = strtok(NULL, " ");
+            if (token && strcmp(token, AUTH_TOKEN) == 0) {
+                cl->authenticated = 1;
+                send_line(fd, "OK AUTHENTICATED");
+            } else {
+                send_line(fd, "ERR 001 AUTH_FAILED");
+            }
+            continue;
+        }
+
+        if (!cl->authenticated) {
+            send_line(fd, "ERR 001 AUTH_REQUIRED");
+            continue;
+        }
+
+        if (strcmp(cmd, "SYSINFO") == 0) {
+            char stats[128];
+            get_sysinfo(stats, sizeof(stats));
+            char resp[256];
+            snprintf(resp, sizeof(resp), "OK SYSINFO %s", stats);
+            send_line(fd, resp);
+        }
+        else if (strcmp(cmd, "LISTPROC") == 0) {
+            char procs[2048];
+            get_procs(procs, sizeof(procs));
+            char resp[2200];
+            snprintf(resp, sizeof(resp), "OK PROCS %s", procs);
+            send_line(fd, resp);
+        }
+        else if (strcmp(cmd, "EXEC") == 0) {
+            char *name = strtok(NULL, " ");
+            if (!name) {
+                send_line(fd, "ERR 002 COMMAND_NOT_ALLOWED");
+                continue;
+            }
+            char result[512];
+            if (do_exec(name, result, sizeof(result)) == 0) {
+                char resp[600];
+                snprintf(resp, sizeof(resp), "OK EXEC_RESULT %s", result);
+                send_line(fd, resp);
+            } else {
+                send_line(fd, "ERR 002 COMMAND_NOT_ALLOWED");
+            }
+        }
+        else if (strcmp(cmd, "PUT") == 0) {
+            char *fname = strtok(NULL, " ");
+            char *sizestr = strtok(NULL, " ");
+            if (!fname || !sizestr) {
+                send_line(fd, "ERR 003 BAD_REQUEST");
+                continue;
+            }
+            long fsize = atol(sizestr);
+            if (fsize <= 0 || fsize > MAX_FILE_SIZE) {
+                send_line(fd, "ERR 004 FILE_TOO_LARGE");
+                char drain[1024];
+                long left = fsize;
+                while (left > 0) {
+                    size_t chunk = left > 1024 ? 1024 : left;
+                    if (recv_exact(fd, drain, chunk) < 0) break;
+                    left -= chunk;
+                }
+                continue;
+            }
+
+            mkdir("./agentfiles", 0755);
+            mkdir(STORAGE_DIR, 0755);
+
+            char path[512];
+            snprintf(path, sizeof(path), "%s%s", STORAGE_DIR, fname);
+
+            char *data = malloc(fsize);
+            if (!data || recv_exact(fd, data, fsize) < 0) {
+                free(data);
+                send_line(fd, "ERR 006 TRANSFER_FAILED");
+                continue;
+            }
+            FILE *fp = fopen(path, "wb");
+            if (!fp) {
+                free(data);
+                send_line(fd, "ERR 006 TRANSFER_FAILED");
+                continue;
+            }
+            fwrite(data, 1, fsize, fp);
+            fclose(fp);
+            free(data);
+
+            char resp[256];
+            snprintf(resp, sizeof(resp), "OK FILE_RECEIVED %s", fname);
+            send_line(fd, resp);
+
+            snprintf(logbuf, sizeof(logbuf), "PUT %s (%ld bytes) from %s", fname, fsize, client_ip);
+            log_msg(logbuf);
+        }
+        else if (strcmp(cmd, "GET") == 0) {
+            char *fname = strtok(NULL, " ");
+            if (!fname) {
+                send_line(fd, "ERR 003 BAD_REQUEST");
+                continue;
+            }
+            char path[512];
+            snprintf(path, sizeof(path), "%s%s", STORAGE_DIR, fname);
+            FILE *fp = fopen(path, "rb");
+            if (!fp) {
+                send_line(fd, "ERR 005 FILE_NOT_FOUND");
+                continue;
+            }
+            fseek(fp, 0, SEEK_END);
+            long fsize = ftell(fp);
+            fseek(fp, 0, SEEK_SET);
+
+            char *data = malloc(fsize);
+            if (!data || fread(data, 1, fsize, fp) != (size_t)fsize) {
+                free(data);
+                fclose(fp);
+                send_line(fd, "ERR 006 TRANSFER_FAILED");
+                continue;
+            }
+            fclose(fp);
+
+            char header[256];
+            snprintf(header, sizeof(header), "OK FILE_SEND %s %ld", fname, fsize);
+            send_line(fd, header);
+            send_exact(fd, data, fsize);
+            free(data);
+
+            snprintf(logbuf, sizeof(logbuf), "GET %s (%ld bytes) to %s", fname, fsize, client_ip);
+            log_msg(logbuf);
+        }
+        else if (strcmp(cmd, "MONITOR") == 0) {
+            char *sub = strtok(NULL, " ");
+            if (sub && strcmp(sub, "START") == 0) {
+                char *portstr = strtok(NULL, " ");
+                if (!portstr) {
+                    send_line(fd, "ERR 003 BAD_REQUEST");
+                    continue;
+                }
+                cl->udp_port = atoi(portstr);
+                if (cl->mon_running) {
+                    cl->mon_running = 0;
+                    pthread_join(cl->mon_tid, NULL);
+                }
+                cl->mon_running = 1;
+                pthread_create(&cl->mon_tid, NULL, monitor_thread, cl);
+                send_line(fd, "OK MONITOR_STARTED");
+            }
+            else if (sub && strcmp(sub, "STOP") == 0) {
+                if (cl->mon_running) {
+                    cl->mon_running = 0;
+                    pthread_join(cl->mon_tid, NULL);
+                }
+                send_line(fd, "OK MONITOR_STOPPED");
+            }
+            else {
+                send_line(fd, "ERR 003 BAD_REQUEST");
+            }
+        }
+        else if (strcmp(cmd, "QUIT") == 0) {
+            if (cl->mon_running) {
+                cl->mon_running = 0;
+                pthread_join(cl->mon_tid, NULL);
+            }
+            send_line(fd, "OK BYE");
+            break;
+        }
+        else {
+            send_line(fd, "ERR 003 UNKNOWN_COMMAND");
+        }
+    }
+
+    if (cl->mon_running) {
+        cl->mon_running = 0;
+        pthread_join(cl->mon_tid, NULL);
+    }
+    close(fd);
+    snprintf(logbuf, sizeof(logbuf), "Client %s disconnected fd=%d", client_ip, fd);
+    log_msg(logbuf);
+
+    pthread_mutex_lock(&clients_mutex);
+    cl->tcp_fd = 0;
+    pthread_mutex_unlock(&clients_mutex);
+    return NULL;
+}
+
+int main(void) {
+    signal(SIGPIPE, SIG_IGN);
+
+    mkdir("./agentfiles", 0755);
+    mkdir(STORAGE_DIR, 0755);
+
+    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_fd < 0) { perror("socket"); exit(1); }
+
+    int opt = 1;
+    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = INADDR_ANY;
+    addr.sin_port = htons(PORT);
+
+    if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        perror("bind"); exit(1);
+    }
+    if (listen(listen_fd, 16) < 0) {
+        perror("listen"); exit(1);
+    }
+
+    printf("RemoteOps Agent started on port %d (SID:8632)\n", PORT);
+    log_msg("Agent started");
+
+    while (1) {
+        struct sockaddr_in cli;
+        socklen_t clilen = sizeof(cli);
+        int *cfd = malloc(sizeof(int));
+        *cfd = accept(listen_fd, (struct sockaddr *)&cli, &clilen);
+        if (*cfd < 0) {
+            free(cfd);
+            continue;
+        }
+        pthread_t tid;
+        pthread_create(&tid, NULL, client_handler, cfd);
+        pthread_detach(tid);
+    }
+    return 0;
+}
